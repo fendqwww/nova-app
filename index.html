@@ -101,7 +101,7 @@ body{font-family:var(--mono);font-size:12px}
 </div>
 
 <script type="module">
-import { HandLandmarker, FilesetResolver } from "./lib/vision_bundle.mjs";
+import { HandLandmarker, FilesetResolver } from "./lib/vision_bundle.mjs?v=2";
 
 const $ = (s) => document.querySelector(s);
 const video = $("#cam"), canvas = $("#fx"), ctx = canvas.getContext("2d");
@@ -154,15 +154,47 @@ async function openCamera() {
   video.classList.toggle("back", facing !== "user");
   await video.play();
 }
-async function loadModel() {
-  const files = await FilesetResolver.forVisionTasks("./lib");
+/* скачиваем модель и движок сразу при открытии страницы, с процентами */
+const SIZES = { wasm: 9.4e6, model: 7.8e6 }, got = { wasm: 0, model: 0 };
+let onProgress = () => {};
+async function fetchBytes(url, key) {
+  const res = await fetch(url, { cache: "force-cache" });
+  if (!res.ok) throw new Error(`файл ${url} не скачался (${res.status})`);
+  const total = Number(res.headers.get("content-length")) || SIZES[key];
+  SIZES[key] = total;
+  if (!res.body || !res.body.getReader) { const b = new Uint8Array(await res.arrayBuffer()); got[key] = b.length; onProgress(); return b; }
+  const reader = res.body.getReader(), chunks = []; let n = 0;
+  for (;;) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); n += value.length; got[key] = n; onProgress(); }
+  const out = new Uint8Array(n); let o = 0; for (const c of chunks) { out.set(c, o); o += c.length; }
+  return out;
+}
+const pct = () => Math.min(99, Math.round((got.wasm + got.model) / (SIZES.wasm + SIZES.model) * 100));
+const assets = Promise.all([
+  fetchBytes("./lib/vision_wasm_internal.wasm?v=2", "wasm"),
+  fetchBytes("./models/hand_landmarker.task?v=2", "model"),
+]);
+assets.catch(() => {});
+const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms))]);
+
+async function loadModel(status) {
+  onProgress = () => status(`загрузка ${pct()}%`);
+  onProgress();
+  const [wasm, model] = await assets;
+  status("запуск…");
+  const wasmUrl = URL.createObjectURL(new Blob([wasm], { type: "application/wasm" }));
+  const files = { wasmLoaderPath: new URL("./lib/vision_wasm_internal.js?v=2", location.href).href, wasmBinaryPath: wasmUrl };
   const opts = (delegate) => ({
-    baseOptions: { modelAssetPath: "./models/hand_landmarker.task", delegate },
+    baseOptions: { modelAssetBuffer: model, delegate },
     runningMode: "VIDEO", numHands: 2,
     minHandDetectionConfidence: 0.5, minHandPresenceConfidence: 0.5, minTrackingConfidence: 0.5,
   });
-  try { return await HandLandmarker.createFromOptions(files, opts("GPU")); }
-  catch (e) { console.warn("gpu off", e); return await HandLandmarker.createFromOptions(files, opts("CPU")); }
+  // на айфоне gpu-режим mediapipe может зависнуть навсегда, там сразу cpu
+  if (!isIOS) {
+    try { return await withTimeout(HandLandmarker.createFromOptions(files, opts("GPU")), 8000); }
+    catch (e) { console.warn("gpu off", e); }
+  }
+  return await withTimeout(HandLandmarker.createFromOptions(files, opts("CPU")), 25000);
 }
 
 $("#start").addEventListener("click", async () => {
@@ -171,8 +203,7 @@ $("#start").addEventListener("click", async () => {
   try {
     btn.textContent = "камера…";
     await openCamera();
-    btn.textContent = "загрузка модели…";
-    landmarker = await loadModel();
+    landmarker = await loadModel((s) => (btn.textContent = s));
     video.classList.add("on"); $("#intro").classList.add("hide"); $("#hud").classList.add("on");
     setMode("frame");
     requestAnimationFrame(loop);
@@ -181,6 +212,8 @@ $("#start").addEventListener("click", async () => {
     btn.disabled = false; btn.textContent = "ещё раз";
     err.textContent = e && e.name === "NotAllowedError"
       ? "доступ к камере запрещён. разреши его в настройках safari для этого сайта"
+      : e && e.message === "timeout"
+      ? "модель долго не запускается. закрой вкладку полностью и открой заново"
       : "не получилось запустить: " + (e && (e.message || e.name) || e);
   }
 });
